@@ -16,7 +16,7 @@ class LoopToolsSpaceRelaxOperator(bpy.types.Operator):
         bpy.ops.mesh.looptools_relax(iterations='3')
 
         # 返回对象模式（可选）
-        bpy.ops.object.mode_set(mode='OBJECT')
+#        bpy.ops.object.mode_set(mode='OBJECT')
 
         return {'FINISHED'}
 
