@@ -1,10 +1,10 @@
 bl_info = {
     "name": "机场开发工具",
     "author": "Your Name",
-    "version": (1, 0),
+    "version": (1, 1),
     "blender": (2, 80, 0),
     "location": "View3D > Sidebar > 机场开发工具",
-    "description": "整合常用材质、顶点、纹理及网格编辑工具",
+    "description": "整合常用材质、顶点、纹理、网格及游标模式工具",
     "category": "Tool",
 }
 
@@ -273,6 +273,38 @@ class MATERIAL_OT_make_single_user(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# ==================== 7. 游标模式切换 ====================
+class SCENE_OT_toggle_cursor_mode(bpy.types.Operator):
+    bl_idname = "scene.toggle_cursor_mode"
+    bl_label = "切换游标模式"
+    bl_description = "切换变换坐标系和轴心点：游标模式（游标/游标）或默认模式（全局/质心点）"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        tool_settings = context.tool_settings
+
+        # 获取当前变换坐标系（第一个槽）
+        current_orientation = scene.transform_orientation_slots[0].type
+        current_pivot = tool_settings.transform_pivot_point
+
+        # 判断当前是否为游标模式（两者均为 CURSOR）
+        if current_orientation == 'CURSOR' and current_pivot == 'CURSOR':
+            # 切换到默认模式
+            scene.transform_orientation_slots[0].type = 'GLOBAL'
+            tool_settings.transform_pivot_point = 'MEDIAN_POINT'
+            self.report({'INFO'}, "已切换到默认模式（全局/质心点）")
+        else:
+            # 切换到游标模式
+            scene.transform_orientation_slots[0].type = 'CURSOR'
+            tool_settings.transform_pivot_point = 'CURSOR'
+            self.report({'INFO'}, "已切换到游标模式（游标/游标）")
+
+        # 强制刷新界面
+        context.area.tag_redraw()
+        return {'FINISHED'}
+
+
 # ==================== 面板 ====================
 class VIEW3D_PT_airport_dev_tools(bpy.types.Panel):
     bl_label = "机场开发工具"
@@ -283,6 +315,29 @@ class VIEW3D_PT_airport_dev_tools(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
+        scene = context.scene
+        tool_settings = context.tool_settings
+
+        # ----- 游标模式 -----
+        layout.label(text="游标模式", icon='PIVOT_CURSOR')
+        # 获取当前设置
+        orientation = scene.transform_orientation_slots[0].type
+        pivot = tool_settings.transform_pivot_point
+        if orientation == 'CURSOR' and pivot == 'CURSOR':
+            mode_text = "当前：游标模式"
+            mode_icon = 'PIVOT_CURSOR'
+        else:
+            mode_text = "当前：默认模式"
+            mode_icon = 'PIVOT_MEDIAN'
+        row = layout.row(align=True)
+        row.label(text=mode_text, icon=mode_icon)
+        row.operator("scene.toggle_cursor_mode", text="切换", icon='FILE_REFRESH')
+        # 显示详细设置（可选）
+        box = layout.box()
+        col = box.column(align=True)
+        col.label(text="变换坐标系: " + orientation.title())
+        col.label(text="轴心点: " + pivot.title().replace('_', ' '))
+        layout.separator()
 
         # ----- 材质工具 -----
         layout.label(text="材质工具", icon='MATERIAL')
@@ -319,6 +374,7 @@ classes = (
     MATERIAL_OT_set_texture_extend_all,
     MATERIAL_OT_set_texture_extend_selected,
     MATERIAL_OT_make_single_user,
+    SCENE_OT_toggle_cursor_mode,
     VIEW3D_PT_airport_dev_tools,
 )
 
