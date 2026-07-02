@@ -1,7 +1,7 @@
 bl_info = {
     "name": "机场开发工具",
     "author": "Your Name",
-    "version": (1, 1),
+    "version": (1, 3),
     "blender": (2, 80, 0),
     "location": "View3D > Sidebar > 机场开发工具",
     "description": "整合常用材质、顶点、纹理、网格及游标模式工具",
@@ -9,13 +9,15 @@ bl_info = {
 }
 
 import bpy
+import bmesh
+from mathutils import Vector
 
 
-# ==================== 1. 删除未使用材质槽 ====================
+# ==================== 1. 删除未使用材质槽（极速版） ====================
 class OBJECT_OT_clean_unused_material_slots(bpy.types.Operator):
     bl_idname = "object.clean_unused_material_slots"
     bl_label = "删除未用材质槽"
-    bl_description = "删除选中网格物体上未被任何面使用的材质槽"
+    bl_description = "删除选中网格物体上未被任何面使用的材质槽（直接数据操作，极速）"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -26,42 +28,35 @@ class OBJECT_OT_clean_unused_material_slots(bpy.types.Operator):
 
         processed = 0
         for obj in selected:
-            if obj.type != 'MESH':
+            if obj.type != 'MESH' or not obj.material_slots:
                 continue
-            # 保存当前选择状态
-            original_selected = context.selected_objects[:]
-            original_active = context.view_layer.objects.active
 
-            # 仅选中当前物体
-            bpy.ops.object.select_all(action='DESELECT')
-            obj.select_set(True)
-            context.view_layer.objects.active = obj
-
-            # 进入编辑模式再退出，刷新材质分配
-            bpy.ops.object.mode_set(mode='EDIT')
-            bpy.ops.object.mode_set(mode='OBJECT')
-
-            # 删除未使用材质槽
-            try:
-                bpy.ops.object.material_slot_remove_unused()
+            mesh = obj.data
+            if not mesh.polygons:
+                # 没有多边形，直接清空材质槽
+                mesh.materials.clear()
                 processed += 1
-            except Exception as e:
-                self.report({'ERROR'}, f"清理 {obj.name} 失败: {e}")
+                continue
 
-            # 恢复选择
-            bpy.ops.object.select_all(action='DESELECT')
-            for o in original_selected:
-                o.select_set(True)
-            context.view_layer.objects.active = original_active
+            # 收集所有面使用的材质索引
+            used_indices = set()
+            for poly in mesh.polygons:
+                used_indices.add(poly.material_index)
+
+            # 从后往前删除未使用的材质槽
+            for idx in range(len(mesh.materials) - 1, -1, -1):
+                if idx not in used_indices:
+                    mesh.materials.pop(index=idx)
+            processed += 1
 
         self.report({'INFO'}, f"已清理 {processed} 个物体")
         return {'FINISHED'}
 
 
-# ==================== 2. 顶点颜色转 Alpha ====================
+# ==================== 2. 设置透明（顶点颜色 → Alpha） ====================
 class MATERIAL_OT_vertex_color_to_alpha(bpy.types.Operator):
     bl_idname = "material.vertex_color_to_alpha"
-    bl_label = "顶点颜色控透明"
+    bl_label = "设置透明"
     bl_description = "将选中物体的顶点颜色连接到原理化BSDF的Alpha通道"
     bl_options = {'REGISTER', 'UNDO'}
 
@@ -132,11 +127,11 @@ class MATERIAL_OT_vertex_color_to_alpha(bpy.types.Operator):
         return {'FINISHED'}
 
 
-# ==================== 3. 顶点颜色设为黑色 ====================
-class OBJECT_OT_set_vertex_color_black(bpy.types.Operator):
-    bl_idname = "object.set_vertex_color_black"
-    bl_label = "顶点颜色归零（黑）"
-    bl_description = "将选中物体的顶点颜色全部设为纯黑色（RGBA: 0,0,0,1）"
+# ==================== 3. 取消透明（断开 Alpha 连接） ====================
+class MATERIAL_OT_vertex_color_clear_alpha(bpy.types.Operator):
+    bl_idname = "material.vertex_color_clear_alpha"
+    bl_label = "取消透明"
+    bl_description = "断开选中物体材质中顶点颜色到Alpha的连接，恢复Alpha为1.0"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -145,6 +140,69 @@ class OBJECT_OT_set_vertex_color_black(bpy.types.Operator):
             self.report({'WARNING'}, "没有选中任何物体")
             return {'CANCELLED'}
 
+        materials = set()
+        for obj in objects:
+            if obj.type == 'MESH':
+                for slot in obj.material_slots:
+                    if slot.material:
+                        materials.add(slot.material)
+
+        for mat in materials:
+            if mat.node_tree is None:
+                continue
+            node_tree = mat.node_tree
+            # 查找连接到 Alpha 的 Attribute 节点
+            attr_nodes = []
+            for node in node_tree.nodes:
+                if node.type == 'ATTRIBUTE' and node.attribute_name == 'Col':
+                    # 检查是否连接到某个 BSDF 的 Alpha
+                    for output in node.outputs:
+                        if output.links:
+                            for link in output.links:
+                                if link.to_socket.name == 'Alpha' and link.to_node.type == 'BSDF_PRINCIPLED':
+                                    attr_nodes.append(node)
+                                    break
+            for node in attr_nodes:
+                # 断开所有连接
+                for output in node.outputs:
+                    for link in output.links:
+                        node_tree.links.remove(link)
+                # 删除节点
+                node_tree.nodes.remove(node)
+
+            # 将原理化BSDF的Alpha设为1.0
+            for node in node_tree.nodes:
+                if node.type == 'BSDF_PRINCIPLED':
+                    node.inputs['Alpha'].default_value = 1.0
+
+        self.report({'INFO'}, "已断开顶点颜色与Alpha的连接")
+        return {'FINISHED'}
+
+
+# ==================== 4. 设置顶点颜色（支持颜色选择） ====================
+class OBJECT_OT_set_vertex_color(bpy.types.Operator):
+    bl_idname = "object.set_vertex_color"
+    bl_label = "设置顶点颜色"
+    bl_description = "将选中物体的顶点颜色设为指定的颜色（RGBA）"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    color: bpy.props.FloatVectorProperty(
+        name="颜色",
+        subtype='COLOR',
+        size=4,
+        min=0.0, max=1.0,
+        default=(0.0, 0.0, 0.0, 1.0),
+        description="要设置的顶点颜色"
+    )
+
+    def execute(self, context):
+        objects = context.selected_objects
+        if not objects:
+            self.report({'WARNING'}, "没有选中任何物体")
+            return {'CANCELLED'}
+
+        # 从场景属性读取颜色（面板中调整的值）
+        color = context.scene.vertex_color_value
         count = 0
         for obj in objects:
             if obj.type != 'MESH':
@@ -153,15 +211,19 @@ class OBJECT_OT_set_vertex_color_black(bpy.types.Operator):
             vcol = mesh.vertex_colors.active
             if vcol is None:
                 vcol = mesh.vertex_colors.new(name="Col")
-            for loop in vcol.data:
-                loop.color = (0.0, 0.0, 0.0, 1.0)
+            # 批量写入（极速）
+            total = len(vcol.data)
+            if total == 0:
+                continue
+            flat = [color[0], color[1], color[2], color[3]] * total
+            vcol.data.foreach_set("color", flat)
             count += 1
 
-        self.report({'INFO'}, f"已将 {count} 个物体的顶点颜色设为黑色")
+        self.report({'INFO'}, f"已将 {count} 个物体的顶点颜色设为 ({color[0]:.2f}, {color[1]:.2f}, {color[2]:.2f}, {color[3]:.2f})")
         return {'FINISHED'}
 
 
-# ==================== 4. Space + Relax (3次) ====================
+# ==================== 5. Space + Relax (3次) ====================
 class MESH_OT_looptools_space_relax(bpy.types.Operator):
     bl_idname = "mesh.looptools_space_relax"
     bl_label = "Space + Relax (×3)"
@@ -169,7 +231,6 @@ class MESH_OT_looptools_space_relax(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        # 检查 LoopTools 是否启用
         if not hasattr(bpy.ops.mesh, 'looptools_space'):
             self.report({'ERROR'}, "LoopTools 插件未启用，请在偏好设置中启用")
             return {'CANCELLED'}
@@ -177,12 +238,109 @@ class MESH_OT_looptools_space_relax(bpy.types.Operator):
         bpy.ops.object.mode_set(mode='EDIT')
         bpy.ops.mesh.looptools_space()
         bpy.ops.mesh.looptools_relax(iterations='3')
-        # 保持编辑模式，方便继续调整
         self.report({'INFO'}, "已执行 Space 和 Relax（3次）")
         return {'FINISHED'}
 
 
-# ==================== 5. 纹理扩展模式 → EXTEND ====================
+# ==================== 6. 堆叠UV岛到中心（0.5,0.5） ====================
+class MESH_OT_stack_uv_islands(bpy.types.Operator):
+    bl_idname = "mesh.stack_uv_islands"
+    bl_label = "堆叠UV岛(0.5)"
+    bl_description = "将每个UV岛的中心平移到(0.5,0.5)，保持形状不变"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        # 退出编辑模式
+        if context.mode == 'EDIT_MESH':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        selected = context.selected_objects
+        if not selected:
+            self.report({'WARNING'}, "没有选中任何物体")
+            return {'CANCELLED'}
+
+        target = Vector((0.5, 0.5))
+        processed = 0
+
+        for obj in selected:
+            if obj.type != 'MESH':
+                continue
+            mesh = obj.data
+            if not mesh.uv_layers.active:
+                self.report({'INFO'}, f"跳过 '{obj.name}'：无活动UV层")
+                continue
+
+            bm = bmesh.new()
+            bm.from_mesh(mesh)
+            uv_layer = bm.loops.layers.uv.active
+            if uv_layer is None:
+                bm.free()
+                continue
+
+            faces = list(bm.faces)
+            if not faces:
+                bm.free()
+                continue
+
+            # ---- 基于UV坐标连通性划分岛 ----
+            uv_to_faces = {}
+            for face in faces:
+                for loop in face.loops:
+                    uv = loop[uv_layer].uv
+                    key = (round(uv.x, 6), round(uv.y, 6))
+                    uv_to_faces.setdefault(key, set()).add(face)
+
+            parent = {face: face for face in faces}
+
+            def find(x):
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+
+            def union(a, b):
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[rb] = ra
+
+            for faces_set in uv_to_faces.values():
+                faces_list = list(faces_set)
+                if len(faces_list) > 1:
+                    first = faces_list[0]
+                    for f in faces_list[1:]:
+                        union(first, f)
+
+            islands = {}
+            for face in faces:
+                root = find(face)
+                islands.setdefault(root, []).append(face)
+
+            # ---- 平移每个岛到目标中心 ----
+            for island in islands.values():
+                uv_coords = []
+                for face in island:
+                    for loop in face.loops:
+                        uv = loop[uv_layer].uv
+                        uv_coords.append(Vector((uv.x, uv.y)))
+                if not uv_coords:
+                    continue
+                center = sum(uv_coords, Vector((0.0, 0.0))) / len(uv_coords)
+                offset = target - center
+                for face in island:
+                    for loop in face.loops:
+                        loop[uv_layer].uv.x += offset.x
+                        loop[uv_layer].uv.y += offset.y
+
+            bm.to_mesh(mesh)
+            bm.free()
+            mesh.update()
+            processed += 1
+
+        self.report({'INFO'}, f"已处理 {processed} 个物体，UV岛堆叠到(0.5,0.5)")
+        return {'FINISHED'}
+
+
+# ==================== 7. 纹理扩展模式 → EXTEND ====================
 class MATERIAL_OT_set_texture_extend_all(bpy.types.Operator):
     bl_idname = "material.set_texture_extend_all"
     bl_label = "所有材质纹理→扩展"
@@ -229,7 +387,7 @@ class MATERIAL_OT_set_texture_extend_selected(bpy.types.Operator):
         return {'FINISHED'}
 
 
-# ==================== 6. 材质转独享 (SU) ====================
+# ==================== 8. 材质转独享 (SU) ====================
 class MATERIAL_OT_make_single_user(bpy.types.Operator):
     bl_idname = "material.make_single_user"
     bl_label = "转独享材质 (SU)"
@@ -273,7 +431,7 @@ class MATERIAL_OT_make_single_user(bpy.types.Operator):
         return {'FINISHED'}
 
 
-# ==================== 7. 游标模式切换 ====================
+# ==================== 9. 游标模式切换 ====================
 class SCENE_OT_toggle_cursor_mode(bpy.types.Operator):
     bl_idname = "scene.toggle_cursor_mode"
     bl_label = "切换游标模式"
@@ -284,23 +442,18 @@ class SCENE_OT_toggle_cursor_mode(bpy.types.Operator):
         scene = context.scene
         tool_settings = context.tool_settings
 
-        # 获取当前变换坐标系（第一个槽）
         current_orientation = scene.transform_orientation_slots[0].type
         current_pivot = tool_settings.transform_pivot_point
 
-        # 判断当前是否为游标模式（两者均为 CURSOR）
         if current_orientation == 'CURSOR' and current_pivot == 'CURSOR':
-            # 切换到默认模式
             scene.transform_orientation_slots[0].type = 'GLOBAL'
             tool_settings.transform_pivot_point = 'MEDIAN_POINT'
             self.report({'INFO'}, "已切换到默认模式（全局/质心点）")
         else:
-            # 切换到游标模式
             scene.transform_orientation_slots[0].type = 'CURSOR'
             tool_settings.transform_pivot_point = 'CURSOR'
             self.report({'INFO'}, "已切换到游标模式（游标/游标）")
 
-        # 强制刷新界面
         context.area.tag_redraw()
         return {'FINISHED'}
 
@@ -320,7 +473,6 @@ class VIEW3D_PT_airport_dev_tools(bpy.types.Panel):
 
         # ----- 游标模式 -----
         layout.label(text="游标模式", icon='PIVOT_CURSOR')
-        # 获取当前设置
         orientation = scene.transform_orientation_slots[0].type
         pivot = tool_settings.transform_pivot_point
         if orientation == 'CURSOR' and pivot == 'CURSOR':
@@ -332,7 +484,6 @@ class VIEW3D_PT_airport_dev_tools(bpy.types.Panel):
         row = layout.row(align=True)
         row.label(text=mode_text, icon=mode_icon)
         row.operator("scene.toggle_cursor_mode", text="切换", icon='FILE_REFRESH')
-        # 显示详细设置（可选）
         box = layout.box()
         col = box.column(align=True)
         col.label(text="变换坐标系: " + orientation.title())
@@ -344,33 +495,39 @@ class VIEW3D_PT_airport_dev_tools(bpy.types.Panel):
         row = layout.row(align=True)
         row.operator("material.make_single_user", text="转独享(SU)")
         row.operator("object.clean_unused_material_slots", text="清未用槽")
+        layout.separator()
 
         # ----- 顶点颜色工具 -----
-        layout.separator()
         layout.label(text="顶点颜色工具", icon='VERTEXSEL')
         row = layout.row(align=True)
-        row.operator("material.vertex_color_to_alpha", text="控透明")
-        row.operator("object.set_vertex_color_black", text="归零黑")
+        row.operator("material.vertex_color_to_alpha", text="设置透明")
+        row.operator("material.vertex_color_clear_alpha", text="取消透明")
+        row = layout.row(align=True)
+        row.prop(scene, "vertex_color_value", text="")
+        row.operator("object.set_vertex_color", text="设置顶点颜色")
+        layout.separator()
 
         # ----- 纹理工具 -----
-        layout.separator()
         layout.label(text="纹理扩展模式", icon='TEXTURE')
         row = layout.row(align=True)
         row.operator("material.set_texture_extend_all", text="全部→扩展")
         row.operator("material.set_texture_extend_selected", text="选中→扩展")
+        layout.separator()
 
         # ----- 网格工具 -----
-        layout.separator()
         layout.label(text="网格工具", icon='MESH_DATA')
         layout.operator("mesh.looptools_space_relax", text="Space + Relax (×3)", icon='MOD_SMOOTH')
+        layout.operator("mesh.stack_uv_islands", text="堆叠UV岛(0.5)", icon='UV')
 
 
-# ==================== 注册 ====================
+# ==================== 注册与注销 ====================
 classes = (
     OBJECT_OT_clean_unused_material_slots,
     MATERIAL_OT_vertex_color_to_alpha,
-    OBJECT_OT_set_vertex_color_black,
+    MATERIAL_OT_vertex_color_clear_alpha,
+    OBJECT_OT_set_vertex_color,
     MESH_OT_looptools_space_relax,
+    MESH_OT_stack_uv_islands,
     MATERIAL_OT_set_texture_extend_all,
     MATERIAL_OT_set_texture_extend_selected,
     MATERIAL_OT_make_single_user,
@@ -381,8 +538,19 @@ classes = (
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+    # 添加场景属性用于存储顶点颜色值
+    bpy.types.Scene.vertex_color_value = bpy.props.FloatVectorProperty(
+        name="顶点颜色",
+        subtype='COLOR',
+        size=4,
+        min=0.0, max=1.0,
+        default=(0.0, 0.0, 0.0, 1.0),
+        description="设置顶点颜色时使用的颜色"
+    )
 
 def unregister():
+    # 删除场景属性
+    del bpy.types.Scene.vertex_color_value
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
 
