@@ -242,101 +242,125 @@ class MESH_OT_looptools_space_relax(bpy.types.Operator):
         return {'FINISHED'}
 
 
-# ==================== 6. 堆叠UV岛到中心（0.5,0.5） ====================
+# ==================== 6. 堆叠UV岛到中心（0.5,0.5）- 基于UV边连通性 ====================
 class MESH_OT_stack_uv_islands(bpy.types.Operator):
     bl_idname = "mesh.stack_uv_islands"
     bl_label = "堆叠UV岛(0.5)"
-    bl_description = "将每个UV岛的中心平移到(0.5,0.5)，保持形状不变"
+    bl_description = "将选中面所属的UV岛中心平移到(0.5,0.5)（基于UV边连通性，精准识别UV岛）"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        # 退出编辑模式
-        if context.mode == 'EDIT_MESH':
-            bpy.ops.object.mode_set(mode='OBJECT')
+        if context.mode != 'EDIT_MESH':
+            self.report({'WARNING'}, "请进入编辑模式（面选择）")
+            return {'CANCELLED'}
 
-        selected = context.selected_objects
-        if not selected:
-            self.report({'WARNING'}, "没有选中任何物体")
+        obj = context.object
+        if obj is None or obj.type != 'MESH':
+            self.report({'WARNING'}, "活动物体不是网格")
+            return {'CANCELLED'}
+
+        mesh = obj.data
+        if not mesh.uv_layers.active:
+            self.report({'INFO'}, f"跳过 '{obj.name}'：无活动UV层")
             return {'CANCELLED'}
 
         target = Vector((0.5, 0.5))
-        processed = 0
+        bm = bmesh.from_edit_mesh(mesh)
+        uv_layer = bm.loops.layers.uv.active
+        if uv_layer is None:
+            self.report({'ERROR'}, "无法获取UV层")
+            return {'CANCELLED'}
 
-        for obj in selected:
-            if obj.type != 'MESH':
-                continue
-            mesh = obj.data
-            if not mesh.uv_layers.active:
-                self.report({'INFO'}, f"跳过 '{obj.name}'：无活动UV层")
-                continue
+        selected_faces = [f for f in bm.faces if f.select]
+        if not selected_faces:
+            self.report({'WARNING'}, "请至少选中一个面")
+            return {'CANCELLED'}
 
-            bm = bmesh.new()
-            bm.from_mesh(mesh)
-            uv_layer = bm.loops.layers.uv.active
-            if uv_layer is None:
-                bm.free()
-                continue
+        # ---- 构建 UV 连通图（基于共享边的 UV 坐标匹配） ----
+        # 将每个面的边和对应的UV顶点坐标对存储起来，方便比较
+        # 结构：{edge: [(face, uv1, uv2), ...]} 其中 uv1, uv2 是向量
+        edge_faces = {}
+        for face in bm.faces:
+            # 获取面的所有循环（loop）
+            loops = face.loops
+            for i in range(len(loops)):
+                loop1 = loops[i]
+                loop2 = loops[(i + 1) % len(loops)]
+                # 获取该边的两个顶点
+                v1 = loop1.vert
+                v2 = loop2.vert
+                # 获取对应的UV坐标（注意顺序）
+                uv1 = loop1[uv_layer].uv.copy()
+                uv2 = loop2[uv_layer].uv.copy()
+                # 用边（无序）作为键
+                edge_key = tuple(sorted((v1.index, v2.index)))
+                edge_faces.setdefault(edge_key, []).append((face, uv1, uv2))
 
-            faces = list(bm.faces)
-            if not faces:
-                bm.free()
-                continue
+        # 并查集合并UV连通的面
+        all_faces = list(bm.faces)
+        parent = {face: face for face in all_faces}
 
-            # ---- 基于UV坐标连通性划分岛 ----
-            uv_to_faces = {}
-            for face in faces:
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        # 对于每条边，检查所有连接的面，如果UV坐标匹配，则合并
+        for edge_key, face_data in edge_faces.items():
+            if len(face_data) < 2:
+                continue
+            # 两两比较
+            for i in range(len(face_data)):
+                for j in range(i + 1, len(face_data)):
+                    face1, uv1_a, uv1_b = face_data[i]
+                    face2, uv2_a, uv2_b = face_data[j]
+                    # 检查UV坐标是否匹配（考虑顺序可能相反）
+                    # 比较 (uv1_a, uv1_b) 与 (uv2_a, uv2_b) 或 (uv2_b, uv2_a)
+                    match1 = (uv1_a - uv2_a).length < 1e-5 and (uv1_b - uv2_b).length < 1e-5
+                    match2 = (uv1_a - uv2_b).length < 1e-5 and (uv1_b - uv2_a).length < 1e-5
+                    if match1 or match2:
+                        union(face1, face2)
+
+        # 收集选中面所属的根
+        selected_roots = set()
+        for f in selected_faces:
+            selected_roots.add(find(f))
+
+        # 收集需要移动的岛（每个根对应一个岛的所有面）
+        islands = []
+        for root in selected_roots:
+            island_faces = [f for f in all_faces if find(f) == root]
+            islands.append(island_faces)
+
+        if not islands:
+            self.report({'INFO'}, "没有需要移动的UV岛")
+            return {'FINISHED'}
+
+        # ---- 平移每个岛到目标中心 ----
+        for island in islands:
+            uv_coords = []
+            for face in island:
                 for loop in face.loops:
                     uv = loop[uv_layer].uv
-                    key = (round(uv.x, 6), round(uv.y, 6))
-                    uv_to_faces.setdefault(key, set()).add(face)
+                    uv_coords.append(Vector((uv.x, uv.y)))
+            if not uv_coords:
+                continue
+            center = sum(uv_coords, Vector((0.0, 0.0))) / len(uv_coords)
+            offset = target - center
+            for face in island:
+                for loop in face.loops:
+                    loop[uv_layer].uv.x += offset.x
+                    loop[uv_layer].uv.y += offset.y
 
-            parent = {face: face for face in faces}
-
-            def find(x):
-                while parent[x] != x:
-                    parent[x] = parent[parent[x]]
-                    x = parent[x]
-                return x
-
-            def union(a, b):
-                ra, rb = find(a), find(b)
-                if ra != rb:
-                    parent[rb] = ra
-
-            for faces_set in uv_to_faces.values():
-                faces_list = list(faces_set)
-                if len(faces_list) > 1:
-                    first = faces_list[0]
-                    for f in faces_list[1:]:
-                        union(first, f)
-
-            islands = {}
-            for face in faces:
-                root = find(face)
-                islands.setdefault(root, []).append(face)
-
-            # ---- 平移每个岛到目标中心 ----
-            for island in islands.values():
-                uv_coords = []
-                for face in island:
-                    for loop in face.loops:
-                        uv = loop[uv_layer].uv
-                        uv_coords.append(Vector((uv.x, uv.y)))
-                if not uv_coords:
-                    continue
-                center = sum(uv_coords, Vector((0.0, 0.0))) / len(uv_coords)
-                offset = target - center
-                for face in island:
-                    for loop in face.loops:
-                        loop[uv_layer].uv.x += offset.x
-                        loop[uv_layer].uv.y += offset.y
-
-            bm.to_mesh(mesh)
-            bm.free()
-            mesh.update()
-            processed += 1
-
-        self.report({'INFO'}, f"已处理 {processed} 个物体，UV岛堆叠到(0.5,0.5)")
+        bmesh.update_edit_mesh(mesh)
+        mesh.update()
+        self.report({'INFO'}, f"已堆叠 {len(islands)} 个UV岛到(0.5,0.5)")
         return {'FINISHED'}
 
 
